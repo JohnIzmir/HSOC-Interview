@@ -1,0 +1,7 @@
+{
+  "name": "Health & Social Care Interview",
+  "description": "An adaptive interview simulation for ESOL learners, focusing on Health and Social Care employability, safeguarding, and language assessment.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
