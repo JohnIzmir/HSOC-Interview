@@ -3,6 +3,15 @@ import React, { useState, useEffect, useRef } from 'react';
 import { AppPhase, Message, DiagnosticData, InterviewData, EvaluationReport } from './types';
 import { INTERVIEWERS, QUESTION_POOL, SYSTEM_INSTRUCTIONS } from './constants';
 import { gemini } from './services/geminiService';
+import { initializeApp } from "firebase/app";
+import { 
+  getAuth, 
+  onAuthStateChanged, 
+  signInWithEmailAndPassword, 
+  createUserWithEmailAndPassword, 
+  signOut,
+  User
+} from "firebase/auth";
 import { 
   BriefcaseIcon, 
   ChatBubbleLeftRightIcon, 
@@ -21,8 +30,27 @@ import {
   MicrophoneIcon,
   SpeakerWaveIcon,
   StopIcon,
-  NoSymbolIcon
+  NoSymbolIcon,
+  EnvelopeIcon,
+  LockClosedIcon,
+  ArrowLeftOnRectangleIcon
 } from '@heroicons/react/24/outline';
+
+// --- Firebase Configuration ---
+// Note: Replace these with your actual Firebase project config values.
+// For Firebase JS SDK v7.20.0 and later, measurementId is optional
+const firebaseConfig = {
+  apiKey: "AIzaSyDyCaAo4ibko8ejFhwQ4Ff052WLC2USfTU",
+  authDomain: "hsoc-interview.firebaseapp.com",
+  projectId: "hsoc-interview",
+  storageBucket: "hsoc-interview.firebasestorage.app",
+  messagingSenderId: "849242505429",
+  appId: "1:849242505429:web:b799c645b3ee53dd85225c",
+  measurementId: "G-622N00YDF2"
+};
+
+const app = initializeApp(firebaseConfig);
+const auth = getAuth(app);
 
 const HISTORY_KEY = 'care_path_session_history';
 
@@ -57,6 +85,13 @@ async function decodeAudioData(
 }
 
 const App: React.FC = () => {
+  const [currentUser, setCurrentUser] = useState<User | null>(null);
+  const [authLoading, setAuthLoading] = useState(true);
+  const [authError, setAuthError] = useState<string | null>(null);
+  const [isLoginView, setIsLoginView] = useState(true);
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+
   const [phase, setPhase] = useState<AppPhase>(AppPhase.LANDING);
   const [messages, setMessages] = useState<Message[]>([]);
   const [userInput, setUserInput] = useState('');
@@ -69,6 +104,7 @@ const App: React.FC = () => {
   const [isRecording, setIsRecording] = useState(false);
   const [isAiSpeaking, setIsAiSpeaking] = useState(false);
   const [muteAudio, setMuteAudio] = useState(false);
+  const [speechError, setSpeechError] = useState<string | null>(null);
   
   const chatEndRef = useRef<HTMLDivElement>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
@@ -76,7 +112,17 @@ const App: React.FC = () => {
   const recognitionRef = useRef<any>(null);
 
   useEffect(() => {
-    const saved = localStorage.getItem(HISTORY_KEY);
+    const unsubscribe = onAuthStateChanged(auth, (user) => {
+      setCurrentUser(user);
+      setAuthLoading(false);
+    });
+    return () => unsubscribe();
+  }, []);
+
+  useEffect(() => {
+    if (!currentUser) return;
+
+    const saved = localStorage.getItem(`${HISTORY_KEY}_${currentUser.uid}`);
     if (saved) {
       try {
         setSessionHistory(JSON.parse(saved));
@@ -85,7 +131,6 @@ const App: React.FC = () => {
       }
     }
 
-    // Initialize Speech Recognition
     const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
     if (SpeechRecognition) {
       const recognition = new SpeechRecognition();
@@ -105,12 +150,21 @@ const App: React.FC = () => {
         }
         if (finalTranscript) {
           setUserInput(prev => prev + ' ' + finalTranscript.trim());
+          setSpeechError(null);
         }
       };
 
       recognition.onerror = (event: any) => {
-        console.error('Speech recognition error:', event.error);
+        console.warn('Speech recognition status:', event.error);
         setIsRecording(false);
+        if (event.error === 'no-speech') {
+          setSpeechError("I didn't hear anything. Please try again!");
+        } else if (event.error === 'not-allowed') {
+          setSpeechError("Microphone access denied.");
+        } else {
+          setSpeechError(`Speech error: ${event.error}`);
+        }
+        setTimeout(() => setSpeechError(null), 4000);
       };
 
       recognition.onend = () => {
@@ -119,26 +173,44 @@ const App: React.FC = () => {
 
       recognitionRef.current = recognition;
     }
-  }, []);
+  }, [currentUser]);
 
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-    
-    // Auto-speak new model messages
     const lastMessage = messages[messages.length - 1];
     if (lastMessage?.role === 'model' && !isAiSpeaking && phase !== AppPhase.REPORT && !muteAudio) {
       speakMessage(lastMessage.text);
     }
   }, [messages]);
 
+  const handleAuth = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setAuthLoading(true);
+    setAuthError(null);
+    try {
+      if (isLoginView) {
+        await signInWithEmailAndPassword(auth, email, password);
+      } else {
+        await createUserWithEmailAndPassword(auth, email, password);
+      }
+    } catch (error: any) {
+      setAuthError(error.message);
+    } finally {
+      setAuthLoading(false);
+    }
+  };
+
+  const handleLogout = async () => {
+    stopAiSpeech();
+    await signOut(auth);
+    reset();
+  };
+
   const speakMessage = async (text: string) => {
     if (!text || muteAudio) return;
-    
-    // Stop any existing speech
     if (activeSourceRef.current) {
       activeSourceRef.current.stop();
     }
-
     try {
       setIsAiSpeaking(true);
       const audioData = await gemini.generateSpeech(text);
@@ -150,13 +222,11 @@ const App: React.FC = () => {
         if (ctx.state === 'suspended') {
           await ctx.resume();
         }
-
         const decoded = decodeBase64(audioData);
         const buffer = await decodeAudioData(decoded, ctx, 24000, 1);
         const source = ctx.createBufferSource();
         source.buffer = buffer;
         source.connect(ctx.destination);
-        
         activeSourceRef.current = source;
         source.onended = () => {
           setIsAiSpeaking(false);
@@ -186,8 +256,14 @@ const App: React.FC = () => {
     } else {
       stopAiSpeech();
       setUserInput('');
-      recognitionRef.current?.start();
-      setIsRecording(true);
+      setSpeechError(null);
+      try {
+        recognitionRef.current?.start();
+        setIsRecording(true);
+      } catch (e) {
+        console.error("Failed to start speech recognition", e);
+        setSpeechError("Speech recognition failed to start.");
+      }
     }
   };
 
@@ -204,10 +280,8 @@ const App: React.FC = () => {
     setMessages(newHistory);
     setUserInput('');
     setIsLoading(true);
-
     const formattedHistory = newHistory.map(m => ({ parts: [{ text: m.text }], role: m.role }));
     const rawResponse = await gemini.getChatResponse(SYSTEM_INSTRUCTIONS.DIAGNOSTIC, formattedHistory);
-    
     try {
       const data = JSON.parse(rawResponse || "");
       if (data.role && data.confidence >= 80) {
@@ -226,9 +300,7 @@ const App: React.FC = () => {
   const startInterview = () => {
     const selectedInterviewer = INTERVIEWERS[Math.floor(Math.random() * INTERVIEWERS.length)];
     const lastSession = sessionHistory[0];
-
     let questions: string[] = [];
-
     if (!lastSession) {
       questions = [
         ...QUESTION_POOL.CATEGORY_1.sort(() => 0.5 - Math.random()).slice(0, 2),
@@ -246,28 +318,22 @@ const App: React.FC = () => {
         { cat: 'CATEGORY_3', score: (lastSession.assessorDashboard.safeguardingCompetency.status === 'Competent' ? 4 : 1) },
         { cat: 'CATEGORY_4', score: (lastSession.assessorDashboard.starStructureReview.status === 'Strong' ? 4 : 1) }
       ].sort((a, b) => a.score - b.score);
-
       const weakestCategory = scores[0].cat as keyof typeof QUESTION_POOL;
       questions.push(...QUESTION_POOL[weakestCategory].sort(() => 0.5 - Math.random()).slice(0, 4));
-      
       const safeguardingStatus = lastSession.assessorDashboard.safeguardingCompetency.status;
       const safeguardingCount = safeguardingStatus !== 'Competent' ? 3 : 1;
       questions.push(...QUESTION_POOL.CATEGORY_3.sort(() => 0.5 - Math.random()).slice(0, safeguardingCount));
-
       const starStatus = lastSession.assessorDashboard.starStructureReview.status;
       const starCount = starStatus !== 'Strong' ? 2 : 1;
       questions.push(...QUESTION_POOL.CATEGORY_4.sort(() => 0.5 - Math.random()).slice(0, starCount));
-
       questions.push(...QUESTION_POOL.CATEGORY_5.sort(() => 0.5 - Math.random()).slice(0, 1));
-
       questions = Array.from(new Set(questions)).slice(0, 10);
       while(questions.length < 10) {
         const randomCat = Object.values(QUESTION_POOL)[Math.floor(Math.random()*5)];
-        const randomQ = randomCat[Math.floor(Math.random()*randomCat.length)];
+        const randomQ = randomCat[Math.floor(randomCat.length)];
         if(!questions.includes(randomQ)) questions.push(randomQ);
       }
     }
-
     setInterview({
       interviewerName: selectedInterviewer,
       questionIndex: 0,
@@ -282,17 +348,14 @@ const App: React.FC = () => {
     if (!interview) return;
     const currentQIndex = interview.questionIndex;
     const nextQIndex = currentQIndex + 1;
-    
     const newMessages = [...messages, { role: 'user', text: input } as Message];
     setMessages(newMessages);
     setUserInput('');
     setIsLoading(true);
-
     if (nextQIndex < 10) {
       const systemPrompt = SYSTEM_INSTRUCTIONS.INTERVIEW(interview.interviewerName, interview.questions);
       const formattedHistory = newMessages.map(m => ({ parts: [{ text: m.text }], role: m.role }));
       const geminiResponse = await gemini.getChatResponse(systemPrompt, formattedHistory);
-      
       setInterview({
         ...interview,
         questionIndex: nextQIndex,
@@ -307,7 +370,6 @@ const App: React.FC = () => {
           rubric: sessionHistory[0].assessorDashboard.rubricScoring,
           safeguarding: sessionHistory[0].assessorDashboard.safeguardingCompetency.status
       } : null;
-
       const evalData = await gemini.getEvaluation(transcript, lastSessionData);
       const reportWithMeta: EvaluationReport = {
         ...evalData,
@@ -321,9 +383,10 @@ const App: React.FC = () => {
   };
 
   const saveToHistory = (newReport: EvaluationReport) => {
+    if (!currentUser) return;
     const updatedHistory = [newReport, ...sessionHistory];
     setSessionHistory(updatedHistory);
-    localStorage.setItem(HISTORY_KEY, JSON.stringify(updatedHistory));
+    localStorage.setItem(`${HISTORY_KEY}_${currentUser.uid}`, JSON.stringify(updatedHistory));
   };
 
   const reset = () => {
@@ -335,8 +398,93 @@ const App: React.FC = () => {
     setReport(null);
     setShowDashboard(false);
     setIsRecording(false);
+    setSpeechError(null);
     if (recognitionRef.current) recognitionRef.current.stop();
   };
+
+  if (authLoading) {
+    return (
+      <div className="flex h-screen items-center justify-center bg-gray-50">
+        <div className="h-12 w-12 border-4 border-indigo-100 border-t-indigo-600 rounded-full animate-spin"></div>
+      </div>
+    );
+  }
+
+  if (!currentUser) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-gradient-to-br from-indigo-50 via-white to-blue-50 px-4">
+        <div className="max-w-md w-full bg-white rounded-3xl shadow-2xl overflow-hidden border border-gray-100">
+          <div className="p-8">
+            <div className="flex justify-center mb-6">
+              <div className="bg-indigo-600 p-4 rounded-2xl shadow-xl shadow-indigo-100">
+                <AcademicCapIcon className="h-10 w-10 text-white" />
+              </div>
+            </div>
+            <h2 className="text-3xl font-black text-center text-gray-900 mb-2">CarePath AI</h2>
+            <p className="text-center text-gray-500 mb-8 font-medium">Professional Social Care Interview Simulation</p>
+            
+            <form onSubmit={handleAuth} className="space-y-4">
+              <div>
+                <label className="block text-xs font-black text-gray-400 uppercase tracking-widest mb-1 ml-1">Email Address</label>
+                <div className="relative">
+                  <EnvelopeIcon className="h-5 w-5 absolute left-4 top-1/2 -translate-y-1/2 text-gray-400" />
+                  <input 
+                    type="email" 
+                    required 
+                    value={email}
+                    onChange={(e) => setEmail(e.target.value)}
+                    placeholder="name@example.com"
+                    className="w-full pl-12 pr-4 py-3 bg-gray-50 border-2 border-transparent focus:border-indigo-500 focus:bg-white rounded-xl outline-none transition-all font-medium"
+                  />
+                </div>
+              </div>
+              <div>
+                <label className="block text-xs font-black text-gray-400 uppercase tracking-widest mb-1 ml-1">Password</label>
+                <div className="relative">
+                  <LockClosedIcon className="h-5 w-5 absolute left-4 top-1/2 -translate-y-1/2 text-gray-400" />
+                  <input 
+                    type="password" 
+                    required 
+                    value={password}
+                    onChange={(e) => setPassword(e.target.value)}
+                    placeholder="••••••••"
+                    className="w-full pl-12 pr-4 py-3 bg-gray-50 border-2 border-transparent focus:border-indigo-500 focus:bg-white rounded-xl outline-none transition-all font-medium"
+                  />
+                </div>
+              </div>
+              
+              {authError && (
+                <div className="p-4 bg-red-50 text-red-600 rounded-xl text-sm font-bold flex items-center gap-2">
+                  <ExclamationTriangleIcon className="h-5 w-5 shrink-0" />
+                  {authError}
+                </div>
+              )}
+              
+              <button 
+                type="submit" 
+                disabled={authLoading}
+                className="w-full bg-indigo-600 hover:bg-indigo-700 text-white font-black py-4 rounded-xl shadow-lg transition-all active:scale-95 disabled:opacity-50"
+              >
+                {isLoginView ? 'Login to Portal' : 'Create Account'}
+              </button>
+            </form>
+            
+            <div className="mt-8 text-center">
+              <button 
+                onClick={() => setIsLoginView(!isLoginView)}
+                className="text-sm font-bold text-indigo-600 hover:text-indigo-800 transition-colors"
+              >
+                {isLoginView ? "Don't have an account? Sign up" : "Already have an account? Login"}
+              </button>
+            </div>
+          </div>
+          <div className="bg-gray-50 p-4 text-center border-t border-gray-100">
+            <p className="text-[10px] font-black text-gray-400 uppercase tracking-widest">Secure Career Development Environment</p>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   const renderScore = (label: string, value: number) => (
     <div className="flex items-center justify-between mb-2">
@@ -372,6 +520,14 @@ const App: React.FC = () => {
             {muteAudio ? <NoSymbolIcon className="h-5 w-5" /> : <SpeakerWaveIcon className="h-5 w-5" />}
           </button>
           
+          <button 
+            onClick={handleLogout}
+            className="p-2 rounded-lg text-gray-400 bg-gray-50 hover:text-red-600 hover:bg-red-50 transition-colors no-print"
+            title="Logout"
+          >
+            <ArrowLeftOnRectangleIcon className="h-5 w-5" />
+          </button>
+
           {phase !== AppPhase.LANDING && (
             <button onClick={reset} className="text-gray-500 hover:text-red-500 transition-colors flex items-center gap-1 text-sm font-medium no-print px-3 py-1 hover:bg-red-50 rounded-lg">
               <ArrowPathIcon className="h-4 w-4" /> Restart
@@ -397,8 +553,11 @@ const App: React.FC = () => {
           <div className="flex-1 flex flex-col items-center justify-center p-8 text-center bg-gradient-to-br from-white to-indigo-50/30 overflow-y-auto">
             <AcademicCapIcon className="h-20 w-20 text-indigo-500 mb-6 animate-bounce-slow" />
             <h2 className="text-3xl font-extrabold text-gray-900 mb-4 leading-tight">Master Your Care Interview</h2>
-            <p className="text-lg text-gray-600 mb-8 max-w-lg leading-relaxed">
+            <p className="text-lg text-gray-600 mb-2 max-w-lg leading-relaxed">
               Experience a realistic Health and Social Care mock interview. Speak your answers, hear the questions, and get a professional ESOL assessment.
+            </p>
+            <p className="text-sm font-black text-indigo-900 mb-8 tracking-widest uppercase opacity-60">
+              Created by John Efes
             </p>
             <div className="flex flex-col gap-4">
               <button 
@@ -409,10 +568,6 @@ const App: React.FC = () => {
                 {sessionHistory.length > 0 ? 'Start Next Session' : 'Begin Simulation'}
               </button>
               
-              <p className="text-sm font-bold text-indigo-900 mt-2 opacity-70">
-                Created by John Efes
-              </p>
-
               <div className="flex items-center gap-6 justify-center mt-4">
                 <div className="flex flex-col items-center gap-1">
                   <SpeakerWaveIcon className="h-5 w-5 text-indigo-400" />
@@ -494,6 +649,12 @@ const App: React.FC = () => {
                         <div className="relative h-3 w-3 bg-indigo-600 rounded-full"></div>
                       </div>
                       <span className="uppercase tracking-widest text-xs">Capturing spoken response... Click stop when finished.</span>
+                    </div>
+                  )}
+                  {speechError && (
+                    <div className="bg-red-50 text-red-600 text-xs font-bold py-2 px-4 rounded-lg flex items-center gap-2 animate-in slide-in-from-bottom-2 duration-300">
+                      <ExclamationTriangleIcon className="h-4 w-4" />
+                      {speechError}
                     </div>
                   )}
                   <form 

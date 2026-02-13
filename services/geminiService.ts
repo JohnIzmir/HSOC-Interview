@@ -22,6 +22,7 @@ export class GeminiService {
       }
     ];
 
+    // Using gemini-3-pro-preview for complex reasoning task
     const response = await this.ai.models.generateContent({
       model: "gemini-3-pro-preview",
       contents,
@@ -34,6 +35,10 @@ export class GeminiService {
           Output JSON format matching the schema provided.
         `,
         responseMimeType: "application/json",
+        temperature: 0.5,
+        topP: 0.9,
+        maxOutputTokens: 15000, // Increased to prevent feedback truncation
+        thinkingConfig: { thinkingBudget: 4000 },
         responseSchema: {
           type: Type.OBJECT,
           properties: {
@@ -130,7 +135,11 @@ export class GeminiService {
     const response = await this.ai.models.generateContent({
       model: "gemini-3-flash-preview",
       contents: contents,
-      config: { systemInstruction, temperature: 0.7 }
+      config: { 
+        systemInstruction, 
+        temperature: 0.5,
+        topP: 0.9
+      }
     });
     return response.text;
   }
